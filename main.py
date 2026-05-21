@@ -1,28 +1,26 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-import psycopg2
-import psycopg2.extras
+from pydantic import BaseModel
+import asyncpg
 import os
 from datetime import datetime
 
 app = FastAPI()
 
-# CORS - dozvoli landing stranicu da poziva ovaj API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Nakon deployanja zamijeni sa svojim domenom
+    allow_origins=["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-def get_db():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+async def get_db():
+    return await asyncpg.connect(os.environ["DATABASE_URL"])
 
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
+@app.on_event("startup")
+async def startup():
+    conn = await get_db()
+    await conn.execute("""
         CREATE TABLE IF NOT EXISTS signups (
             id SERIAL PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
@@ -31,32 +29,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    await conn.close()
 
-# Inicijalizuj bazu pri startu
-@app.on_event("startup")
-def startup():
-    init_db()
-
-# ---- MODELI ----
 class SignupRequest(BaseModel):
     email: str
     city: str
 
-class SignupResponse(BaseModel):
-    success: bool
-    city: str
-    city_count: int
-    city_rank: int        # koji si po redu u svom gradu
-    total_signups: int
-    message: str
-
-# ---- ENDPOINTS ----
-
-@app.post("/signup", response_model=SignupResponse)
-def signup(data: SignupRequest):
+@app.post("/signup")
+async def signup(data: SignupRequest):
     email = data.email.strip().lower()
     city = data.city.strip()
     city_normalized = city.lower().strip()
@@ -66,52 +46,24 @@ def signup(data: SignupRequest):
     if not city or len(city) < 2:
         raise HTTPException(status_code=400, detail="Invalid city")
 
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
+    conn = await get_db()
     try:
-        # Spremi prijavu
-        cur.execute(
-            "INSERT INTO signups (email, city, city_normalized) VALUES (%s, %s, %s)",
-            (email, city, city_normalized)
+        try:
+            await conn.execute(
+                "INSERT INTO signups (email, city, city_normalized) VALUES ($1, $2, $3)",
+                email, city, city_normalized
+            )
+        except asyncpg.UniqueViolationError:
+            pass  # Email vec postoji, nastavljamo
+
+        city_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM signups WHERE city_normalized = $1", city_normalized
         )
-        conn.commit()
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback()
-        # Email vec postoji - vrati trenutne brojeve bez greske
-        cur.execute(
-            "SELECT COUNT(*) FROM signups WHERE city_normalized = %s",
-            (city_normalized,)
-        )
-        city_count = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM signups")
-        total = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-        return SignupResponse(
-            success=True,
-            city=city,
-            city_count=city_count,
-            city_rank=city_count,
-            total_signups=total,
-            message=f"Already registered! {city} has {city_count} founders."
-        )
+        total = await conn.fetchval("SELECT COUNT(*) FROM signups")
 
-    # Broj prijava za ovaj grad
-    cur.execute(
-        "SELECT COUNT(*) FROM signups WHERE city_normalized = %s",
-        (city_normalized,)
-    )
-    city_count = cur.fetchone()[0]
+    finally:
+        await conn.close()
 
-    # Ukupno svih prijava
-    cur.execute("SELECT COUNT(*) FROM signups")
-    total = cur.fetchone()[0]
-
-    cur.close()
-    conn.close()
-
-    # Poruka ovisno o poziciji
     if city_count == 1:
         message = f"You're the FIRST founder in {city}! Share to light up the map."
     elif city_count < 50:
@@ -121,60 +73,53 @@ def signup(data: SignupRequest):
     else:
         message = f"{city} is on fire! #{city_count} and counting."
 
-    return SignupResponse(
-        success=True,
-        city=city,
-        city_count=city_count,
-        city_rank=city_count,
-        total_signups=total,
-        message=message
-    )
-
-
-@app.get("/leaderboard")
-def leaderboard():
-    """Top 10 gradova po broju prijava - za live leaderboard na landingu"""
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("""
-        SELECT city, COUNT(*) as count
-        FROM signups
-        GROUP BY city_normalized, city
-        ORDER BY count DESC
-        LIMIT 10
-    """)
-    rows = cur.fetchall()
-    cur.execute("SELECT COUNT(*) FROM signups")
-    total = cur.fetchone()[0]
-    cur.close()
-    conn.close()
     return {
-        "total": total,
-        "cities": [{"city": r["city"], "count": r["count"]} for r in rows]
+        "success": True,
+        "city": city,
+        "city_count": int(city_count),
+        "city_rank": int(city_count),
+        "total_signups": int(total),
+        "message": message
     }
 
+@app.get("/leaderboard")
+async def leaderboard():
+    conn = await get_db()
+    try:
+        rows = await conn.fetch("""
+            SELECT city, COUNT(*) as count
+            FROM signups
+            GROUP BY city_normalized, city
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        total = await conn.fetchval("SELECT COUNT(*) FROM signups")
+    finally:
+        await conn.close()
+
+    return {
+        "total": int(total),
+        "cities": [{"city": r["city"], "count": int(r["count"])} for r in rows]
+    }
 
 @app.get("/city/{city_name}")
-def city_stats(city_name: str):
-    """Broj prijava za jedan grad - za progress bar"""
+async def city_stats(city_name: str):
     normalized = city_name.lower().strip()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM signups WHERE city_normalized = %s",
-        (normalized,)
-    )
-    count = cur.fetchone()[0]
-    cur.close()
-    conn.close()
+    conn = await get_db()
+    try:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM signups WHERE city_normalized = $1", normalized
+        )
+    finally:
+        await conn.close()
     return {
         "city": city_name,
-        "count": count,
-        "percent": round((count / 2000) * 100, 1),
+        "count": int(count),
+        "percent": round((int(count) / 2000) * 100, 1),
         "goal": 2000
     }
 
-
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok", "time": datetime.now().isoformat()}
+ 
